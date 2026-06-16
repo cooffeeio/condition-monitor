@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#15706B" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="コンディション" />
+  <link rel="manifest" href="./manifest.json" />
+  <title>Condition Monitor</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+  <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+  <script src="https://unpkg.com/lucide@0.383.0/dist/umd/lucide.js"></script>
+  <style>
+    *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+    body{margin:0;background:#E9EDEF;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    #root{padding-bottom:env(safe-area-inset-bottom)}
+    input[type=number]::-webkit-outer-spin-button,input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+    input[type=number]{-moz-appearance:textfield}
+    #splash{position:fixed;inset:0;background:#15706B;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;z-index:9999;transition:opacity .5s}
+    #splash.fade{opacity:0;pointer-events:none}
+    .spin{animation:spin 1s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+  </style>
+</head>
+<body>
+<div id="splash">
+  <svg width="72" height="72" viewBox="0 0 192 192" fill="none">
+    <rect width="192" height="192" rx="40" fill="rgba(255,255,255,0.15)"/>
+    <path d="M40 96 Q60 60 80 80 Q100 100 120 56 Q140 12 160 96" stroke="white" stroke-width="10" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>
+  <span style="color:white;font-size:13px;letter-spacing:0.14em">CONDITION MONITOR</span>
+  <svg class="spin" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.5)" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+</div>
+<div id="root"></div>
+
+<script>
+// ─── aliases ─────────────────────────────────────────────────────────
+const e = React.createElement;
+const {useState,useEffect,useMemo,useCallback,useRef} = React;
+const {
+  ResponsiveContainer,LineChart,Line,XAxis,YAxis,CartesianGrid,Tooltip,
+  ScatterChart,Scatter,ZAxis,BarChart,Bar,Cell,ReferenceLine
+} = Recharts;
+
+// Lucide icons via UMD
+function Icon(name,size=16,color){
+  const el = document.createElement('div');
+  el.innerHTML = lucide.icons[name] ? lucide.icons[name][2].join('') : '';
+  // Use SVG directly
+  return e('svg',{
+    xmlns:'http://www.w3.org/2000/svg',
+    width:size,height:size,
+    viewBox:'0 0 24 24',fill:'none',
+    stroke:color||'currentColor',
+    strokeWidth:2,strokeLinecap:'round',strokeLinejoin:'round',
+    style:{display:'inline-block',flexShrink:0}
+  }, ...(lucide[name]?lucide[name]({size}).props.children||[]:[]))
+}
+// Prebuilt icon components
+function mkIcon(name){return (props)=>Icon(name,props.size||16,props.color||props.style?.color)}
+const IcActivity   = mkIcon('Activity');
+const IcGitBranch  = mkIcon('GitBranch');
+const IcMsg        = mkIcon('MessageSquare');
+const IcDB         = mkIcon('Database');
+const IcAlert      = mkIcon('AlertTriangle');
+const IcCheck      = mkIcon('CheckCircle2');
+const IcTrend      = mkIcon('TrendingUp');
+const IcLoader     = (p)=>e('svg',{width:p.size||16,height:p.size||16,viewBox:'0 0 24 24',fill:'none',stroke:p.style?.color||'currentColor',strokeWidth:2,strokeLinecap:'round',className:'spin'},e('path',{d:'M21 12a9 9 0 1 1-6.219-8.56'}));
+const IcTrash      = mkIcon('Trash2');
+const IcFlask      = mkIcon('FlaskConical');
+const IcSend       = mkIcon('Send');
+const IcUpload     = mkIcon('Upload');
+const IcRefresh    = mkIcon('RefreshCw');
+
+// ─── design tokens ────────────────────────────────────────────────────
+const C={
+  ground:"#E9EDEF",surface:"#FFFFFF",ink:"#16222C",muted:"#5C6B76",
+  faint:"#8A97A0",line:"#D3DADE",teal:"#15706B",tealSoft:"#E2EEED",
+  low:"#B65A35",mid:"#C0901F",good:"#2E7D5B"
+};
+const MONO="ui-monospace,SFMono-Regular,Menlo,monospace";
+
+// ─── fields ───────────────────────────────────────────────────────────
+const FIELDS=[
+  {key:"sleepScore",label:"睡眠スコア",dir:1,kw:["sleepscore","score"]},
+  {key:"sleepDurationMin",label:"睡眠時間(分)",dir:1,kw:["sleeptime","totalsleep","duration","sleepminutes"]},
+  {key:"deepSleepMin",label:"深睡眠(分)",dir:1,kw:["deepsleep","deep"]},
+  {key:"remSleepMin",label:"REM睡眠(分)",dir:1,kw:["rem"]},
+  {key:"hrv",label:"HRV(ms)",dir:1,kw:["hrv","rmssd","variability"]},
+  {key:"restingHR",label:"安静時心拍",dir:-1,kw:["resting","restheart","rhr","heartrate"]},
+  {key:"stress",label:"ストレス",dir:-1,kw:["stress","pressure"]},
+  {key:"readiness",label:"Readiness",dir:1,kw:["readiness","recovery"]},
+  {key:"steps",label:"歩数",dir:0,kw:["steps","step"]},
+  {key:"workoutDurationMin",label:"運動時間(分)",dir:0,kw:["sporttime","workout","exercise","activeminutes"]},
+  {key:"workoutCalories",label:"運動カロリー",dir:0,kw:["calorie","kcal","calories"]},
+  {key:"pai",label:"PAI",dir:0,kw:["pai"]},
+];
+const RECOVERY={readiness:1.4,hrv:1.3,restingHR:1.1,sleepScore:1.1,deepSleepMin:0.9,sleepDurationMin:0.8,stress:0.9};
+const SUM_FIELDS=new Set(["steps","workoutDurationMin","workoutCalories"]);
+
+// ─── math ──────────────────────────────────────────────────────────────
+const pad=n=>String(n).padStart(2,"0");
+const isN=v=>typeof v==="number"&&isFinite(v);
+const mean=a=>a.length?a.reduce((s,x)=>s+x,0)/a.length:NaN;
+const std=a=>{if(a.length<2)return NaN;const m=mean(a);return Math.sqrt(a.reduce((s,x)=>s+(x-m)**2,0)/(a.length-1));};
+const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+function pearson(xs,ys){
+  const px=[],py=[];
+  for(let i=0;i<xs.length;i++)if(isN(xs[i])&&isN(ys[i])){px.push(xs[i]);py.push(ys[i]);}
+  if(px.length<4)return{r:NaN,n:px.length};
+  const mx=mean(px),my=mean(py);let num=0,dx=0,dy=0;
+  for(let i=0;i<px.length;i++){const a=px[i]-mx,b=py[i]-my;num+=a*b;dx+=a*a;dy+=b*b;}
+  const den=Math.sqrt(dx*dy);return{r:den?num/den:NaN,n:px.length};
+}
+function normDate(v){
+  if(v==null)return null;const raw=String(v).trim();if(!raw)return null;
+  if(/^\d{10,13}$/.test(raw)){const n=Number(raw);const d=new Date(n<1e12?n*1000:n);return isNaN(d)?null:`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;}
+  let s=raw.split(/[ T]/)[0].replace(/\//g,"-");
+  const m=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if(m)return`${m[1]}-${pad(m[2])}-${pad(m[3])}`;
+  const d=new Date(s);return isNaN(d)?null:`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+}
+const addDays=(iso,k)=>{const d=new Date(iso+"T00:00:00");d.setDate(d.getDate()+k);return`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;};
+const scoreColor=s=>!isN(s)?C.faint:s>=70?C.good:s>=45?C.mid:C.low;
+const scoreLabel=s=>!isN(s)?"—":s>=70?"良好":s>=45?"標準":"要回復";
+
+// ─── storage ──────────────────────────────────────────────────────────
+const SK="condition-monitor:v1";
+async function loadStore(){
+  try{if(window.storage){const r=await window.storage.get(SK);if(r)return JSON.parse(r.value);}}catch{}
+  try{const r=localStorage.getItem(SK);if(r)return JSON.parse(r);}catch{}
+  return null;
+}
+async function saveStore(obj){
+  const j=JSON.stringify(obj);
+  try{if(window.storage)await window.storage.set(SK,j);}catch{}
+  try{localStorage.setItem(SK,j);}catch{}
+}
+
+// ─── build records ────────────────────────────────────────────────────
+function buildRecords(files,mapping){
+  const day={};
+  for(const f of files){
+    if(!f.dateCol)continue;
+    for(const row of f.rows){
+      const date=normDate(row[f.dateCol]);if(!date)continue;
+      if(!day[date])day[date]={date};
+      for(const fld of FIELDS){
+        const src=mapping[fld.key];if(!src)continue;
+        const[fi,col]=src.split("\0");if(Number(fi)!==f.idx)continue;
+        const val=parseFloat(String(row[col]).replace(/[^0-9.\-]/g,""));
+        if(!isFinite(val))continue;
+        if(SUM_FIELDS.has(fld.key))day[date][fld.key]=(day[date][fld.key]||0)+val;
+        else day[date][fld.key]=val;
+      }
+    }
+  }
+  return Object.values(day).sort((a,b)=>a.date<b.date?-1:1);
+}
+
+// ─── analyze ──────────────────────────────────────────────────────────
+function analyze(records){
+  if(!records||!records.length)return null;
+  const stats={};
+  for(const fld of FIELDS){const vals=records.map(r=>r[fld.key]).filter(isN);if(vals.length>=3)stats[fld.key]={m:mean(vals),s:std(vals)||1};}
+  const wd=records.map(r=>{
+    let wsum=0,w=0;
+    for(const k in RECOVERY){if(!isN(r[k])||!stats[k])continue;const dir=FIELDS.find(f=>f.key===k).dir||1;const z=((r[k]-stats[k].m)/stats[k].s)*dir;wsum+=z*RECOVERY[k];w+=RECOVERY[k];}
+    const condition=w?clamp(Math.round(50+14*(wsum/w)),0,100):null;
+    let load=0,hasLoad=false;
+    if(isN(r.workoutDurationMin)&&r.workoutDurationMin>0){const intensity=isN(r.workoutCalories)&&r.workoutCalories>0?clamp(r.workoutCalories/r.workoutDurationMin/8,0.6,2):1;load+=r.workoutDurationMin*intensity;hasLoad=true;}
+    if(isN(r.steps)){load+=(r.steps/1000)*1.5;hasLoad=true;}
+    if(isN(r.pai)){load+=r.pai;hasLoad=true;}
+    return{...r,condition,load:hasLoad?Math.round(load*10)/10:null};
+  });
+  const byDate={};wd.forEach(r=>byDate[r.date]=r);
+  const lags=[0,1,2,3].map(k=>{const xs=[],ys=[];wd.forEach(r=>{const t=byDate[addDays(r.date,k)];if(r&&t){xs.push(r.load);ys.push(t.condition);}});return{k,...pearson(xs,ys)};});
+  const dkeys=["load","hrv","restingHR","deepSleepMin","sleepDurationMin","stress","steps","sleepScore"];
+  const drivers=dkeys.map(key=>{const xs=[],ys=[];wd.forEach(r=>{const t=byDate[addDays(r.date,1)];if(r&&t){xs.push(r[key]);ys.push(t.condition);}});const lbl=key==="load"?"トレーニング負荷":(FIELDS.find(f=>f.key===key)?.label||key);return{key,label:lbl,...pearson(xs,ys)};}).filter(d=>isN(d.r)).sort((a,b)=>Math.abs(b.r)-Math.abs(a.r));
+  const scatter=[];wd.forEach(r=>{const t=byDate[addDays(r.date,1)];if(r&&t&&isN(r.load)&&isN(t.condition))scatter.push({load:r.load,condition:t.condition});});
+  const flags=[];const latest=wd[wd.length-1];const prior=wd.slice(-8,-1);
+  const baseOf=k=>{const v=prior.map(r=>r[k]).filter(isN);return v.length>=3?mean(v):NaN;};
+  if(latest){
+    const checks=[["hrv",(l,b)=>l<b*0.9,"HRVが平常より低下（回復が追いついていないサイン）"],["restingHR",(l,b)=>l>b*1.05,"安静時心拍が高め（疲労 or 体調変化の可能性）"],["deepSleepMin",(l,b)=>l<b*0.8,"深睡眠がいつもより少ない"],["sleepDurationMin",(l,b)=>l<b*0.85,"睡眠時間が短い"],["stress",(l,b)=>l>b*1.15,"ストレス指標が高い"]];
+    for(const[k,test,msg]of checks){const b=baseOf(k);if(isN(latest[k])&&isN(b)&&test(latest[k],b))flags.push({type:"warn",msg});}
+    if(isN(latest.condition)){if(latest.condition>=70)flags.push({type:"good",msg:"コンディション良好。負荷の高いセッションを入れる好機。"});else if(latest.condition<45)flags.push({type:"warn",msg:"コンディション低め。今日は強度を落とすか回復を優先。"});}
+  }
+  return{records:wd,stats,lags,drivers,scatter,flags,latest,byDate};
+}
+
+// ─── sample ───────────────────────────────────────────────────────────
+function sampleRecords(){
+  const out=[];let base=new Date();base.setDate(base.getDate()-29);
+  let hrv=55,rhr=52;
+  for(let i=0;i<30;i++){
+    const d=new Date(base);d.setDate(base.getDate()+i);
+    const hard=i%4===1||i%7===0;
+    const workout=hard?60+Math.random()*40:(Math.random()<0.4?30:0);
+    hrv+=(55-hrv)*0.3+(hard?-8:4)+(Math.random()*6-3);
+    rhr+=(52-rhr)*0.3+(hard?3:-1.5)+(Math.random()*2-1);
+    out.push({date:`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`,sleepScore:Math.round(clamp(82-(hard?6:0)+(Math.random()*10-5),50,99)),sleepDurationMin:Math.round(clamp(430-(hard?25:0)+(Math.random()*60-30),320,540)),deepSleepMin:Math.round(clamp(85-(hard?15:0)+(Math.random()*30-15),30,140)),hrv:Math.round(clamp(hrv,25,90)),restingHR:Math.round(clamp(rhr,44,68)),stress:Math.round(clamp(40+(hard?12:0)+(Math.random()*16-8),15,80)),steps:Math.round(6000+Math.random()*6000+(workout?2000:0)),workoutDurationMin:Math.round(workout),workoutCalories:Math.round(workout*(8+Math.random()*3))});
+  }
+  return out;
+}
+
+// ─── tiny helpers ─────────────────────────────────────────────────────
+const div=(props,...children)=>e('div',props,...children);
+const btn=(props,...children)=>e('button',props,...children);
+const span=(props,...c)=>e('span',props,...c);
+
+function Metric({label,v,unit}){
+  return div({style:{background:C.ground,borderRadius:8,padding:"8px 12px"}},
+    div({style:{color:C.faint,fontSize:11}},label),
+    div({style:{fontFamily:MONO,color:C.ink,fontSize:16,fontWeight:600}},
+      isN(v)?v:"—",
+      span({style:{color:C.faint,fontSize:11,marginLeft:2}},unit)
+    )
+  );
+}
+
+function Sparkline({data,color}){
+  const valid=data.filter(isN);if(valid.length<2)return null;
+  const w=110,h=40,mn=Math.min(...valid),mx=Math.max(...valid),rng=mx-mn||1;
+  const pts=data.map((v,i)=>isN(v)?`${(i/(data.length-1))*w},${h-((v-mn)/rng)*h}`:null).filter(Boolean).join(" ");
+  return e('svg',{width:w,height:h,style:{overflow:"visible"}},
+    e('polyline',{points:pts,fill:"none",stroke:color,strokeWidth:"2",strokeLinejoin:"round",strokeLinecap:"round"})
+  );
+}
+
+function NoData({msg}){
+  return div({style:{fontSize:13,borderRadius:8,padding:"12px 16px",textAlign:"center",background:C.ground,color:C.muted}},msg);
+}
+
+// ─── READING TAB ──────────────────────────────────────────────────────
+function Reading({a,series}){
+  const lat=a.latest,cond=lat?.condition,col=scoreColor(cond);
+  const spark=a.records.slice(-14).map(r=>r.condition);
+  return div({className:"space-y-4"},
+    // score card
+    div({style:{background:C.surface,border:`1px solid ${C.line}`,borderRadius:12,padding:20}},
+      div({style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}},
+        div(null,
+          div({style:{fontFamily:MONO,color:C.faint,letterSpacing:"0.14em",fontSize:11}},`最新の読み取り · ${lat?.date||""}`),
+          div({style:{display:"flex",alignItems:"flex-end",gap:12,marginTop:4}},
+            div({style:{fontFamily:MONO,color:col,fontSize:60,lineHeight:1,fontWeight:600}},isN(cond)?cond:"—"),
+            div({style:{paddingBottom:6}},
+              div({style:{color:col,fontSize:14,fontWeight:600}},scoreLabel(cond)),
+              div({style:{color:C.faint,fontSize:11}},"コンディション / 100")
+            )
+          )
+        ),
+        e(Sparkline,{data:spark,color:col})
+      ),
+      div({style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginTop:16}},
+        e(Metric,{label:"HRV",v:lat?.hrv,unit:"ms"}),
+        e(Metric,{label:"安静時心拍",v:lat?.restingHR,unit:"bpm"}),
+        e(Metric,{label:"深睡眠",v:lat?.deepSleepMin,unit:"min"}),
+        e(Metric,{label:"負荷",v:lat?.load,unit:""})
+      )
+    ),
+    // flags
+    ...a.flags.map((f,i)=>
+      div({key:i,style:{display:"flex",alignItems:"flex-start",gap:8,borderRadius:8,padding:"10px 12px",fontSize:13,background:f.type==="good"?"#EAF5EF":"#FBF0EA",border:`1px solid ${f.type==="good"?"#BFE3D0":"#EDD2C2"}`}},
+        f.type==="good"?e(IcCheck,{size:15,style:{color:C.good,marginTop:1,flexShrink:0}}):e(IcAlert,{size:15,style:{color:C.low,marginTop:1,flexShrink:0}}),
+        span({style:{color:C.ink}},f.msg)
+      )
+    ),
+    // trend chart
+    div({style:{background:C.surface,border:`1px solid ${C.line}`,borderRadius:12,padding:16}},
+      div({style:{fontSize:14,fontWeight:600,marginBottom:12}},"コンディション × トレーニング負荷"),
+      e(ResponsiveContainer,{width:"100%",height:220},
+        e(LineChart,{data:series,margin:{top:4,right:8,left:-16,bottom:0}},
+          e(CartesianGrid,{stroke:C.line,strokeDasharray:"2 4",vertical:false}),
+          e(XAxis,{dataKey:"date",tick:{fontSize:10,fill:C.faint,fontFamily:MONO},interval:"preserveStartEnd"}),
+          e(YAxis,{yAxisId:"l",domain:[0,100],tick:{fontSize:10,fill:C.faint,fontFamily:MONO}}),
+          e(YAxis,{yAxisId:"r",orientation:"right",tick:{fontSize:10,fill:C.faint,fontFamily:MONO}}),
+          e(Tooltip,{contentStyle:{fontFamily:MONO,fontSize:12,borderColor:C.line,borderRadius:8}}),
+          e(Line,{yAxisId:"l",type:"monotone",dataKey:"condition",name:"コンディション",stroke:C.teal,strokeWidth:2,dot:false}),
+          e(Line,{yAxisId:"r",type:"monotone",dataKey:"load",name:"負荷",stroke:C.low,strokeWidth:1.5,dot:false,strokeDasharray:"3 3"})
+        )
+      ),
+      div({style:{display:"flex",gap:16,marginTop:8,fontSize:11,color:C.muted,fontFamily:MONO}},
+        span({style:{color:C.teal}},"— コンディション"),
+        span({style:{color:C.low}},"-- 負荷")
+      )
+    )
+  );
+}
+
+// ─── CORRELATION TAB ──────────────────────────────────────────────────
+function Correlation({a}){
+  const noLoad=a.lags.every(l=>!isN(l.r));
+  const lagData=a.lags.map(l=>({name:`+${l.k}日`,r:isN(l.r)?Math.round(l.r*100)/100:0,raw:l.r,n:l.n}));
+  const strongest=[...a.lags].filter(l=>isN(l.r)).sort((x,y)=>Math.abs(y.r)-Math.abs(x.r))[0];
+  return div({className:"space-y-4"},
+    div({style:{background:C.surface,border:`1px solid ${C.line}`,borderRadius:12,padding:16}},
+      div({style:{fontSize:14,fontWeight:600,marginBottom:4}},"トレーニング負荷 → 将来のコンディション"),
+      div({style:{fontSize:12,color:C.muted,marginBottom:12}},"ある日の負荷が、0〜3日後のコンディションとどれだけ相関するか。"),
+      noLoad?e(NoData,{msg:"運動時間・歩数・PAIのいずれかをデータタブで対応づけてください。"}):e("div",{style:{display:"contents"}},
+        e(ResponsiveContainer,{width:"100%",height:170},
+          e(BarChart,{data:lagData,margin:{top:4,right:8,left:-16,bottom:0}},
+            e(CartesianGrid,{stroke:C.line,strokeDasharray:"2 4",vertical:false}),
+            e(XAxis,{dataKey:"name",tick:{fontSize:11,fill:C.muted,fontFamily:MONO}}),
+            e(YAxis,{domain:[-1,1],tick:{fontSize:10,fill:C.faint,fontFamily:MONO}}),
+            e(Tooltip,{contentStyle:{fontFamily:MONO,fontSize:12,borderColor:C.line,borderRadius:8},formatter:(v,n,p)=>[`r=${v} (n=${p.payload.n})`,"相関"]}),
+            e(ReferenceLine,{y:0,stroke:C.faint}),
+            e(Bar,{dataKey:"r",radius:[3,3,3,3]},
+              ...lagData.map((d,i)=>e(Cell,{key:i,fill:d.raw<0?C.low:C.teal}))
+            )
+          )
+        ),
+        strongest&&div({style:{fontSize:12,marginTop:8,borderRadius:8,padding:"8px 12px",background:C.tealSoft,color:C.ink}},
+          "最も強い関係は ",e('b',{style:{fontFamily:MONO}},`+${strongest.k}日後`),`（r=${strongest.r.toFixed(2)}）。`,
+          strongest.r<-0.2?" 高負荷の翌日以降にコンディションが落ちる傾向。回復日の配置を検討。":strongest.r>0.2?" 適度な負荷がむしろ良い状態につながっている可能性。":" 明確な関係は弱め。データが増えると精度が上がります。"
+        )
+      )
+    ),
+    a.scatter.length>=4&&div({style:{background:C.surface,border:`1px solid ${C.line}`,borderRadius:12,padding:16}},
+      div({style:{fontSize:14,fontWeight:600,marginBottom:12}},"負荷(当日) × コンディション(翌日)"),
+      e(ResponsiveContainer,{width:"100%",height:190},
+        e(ScatterChart,{margin:{top:4,right:8,left:-16,bottom:0}},
+          e(CartesianGrid,{stroke:C.line,strokeDasharray:"2 4"}),
+          e(XAxis,{type:"number",dataKey:"load",name:"負荷",tick:{fontSize:10,fill:C.faint,fontFamily:MONO}}),
+          e(YAxis,{type:"number",dataKey:"condition",name:"翌日コンディション",domain:[0,100],tick:{fontSize:10,fill:C.faint,fontFamily:MONO}}),
+          e(ZAxis,{range:[50,50]}),
+          e(Tooltip,{contentStyle:{fontFamily:MONO,fontSize:12,borderColor:C.line,borderRadius:8},cursor:{strokeDasharray:"3 3"}}),
+          e(Scatter,{data:a.scatter,fill:C.teal,fillOpacity:0.7})
+        )
+      )
+    ),
+    div({style:{background:C.surface,border:`1px solid ${C.line}`,borderRadius:12,padding:16}},
+      div({style:{fontSize:14,fontWeight:600,marginBottom:4}},"翌日コンディションの予測ドライバー"),
+      div({style:{fontSize:12,color:C.muted,marginBottom:12}},"今日の各指標が翌日のコンディションをどれだけ予測するか。"),
+      a.drivers.length===0?e(NoData,{msg:"データが不足しています。"}):div({style:{display:"flex",flexDirection:"column",gap:8}},
+        ...a.drivers.slice(0,7).map(d=>
+          div({key:d.key,style:{display:"flex",alignItems:"center",gap:10}},
+            div({style:{fontSize:12,width:108,flexShrink:0,color:C.ink}},d.label),
+            div({style:{flex:1,height:8,borderRadius:4,position:"relative",background:C.ground}},
+              div({style:{position:"absolute",top:0,height:8,borderRadius:4,background:d.r<0?C.low:C.teal,width:`${Math.min(Math.abs(d.r)*100,100)}%`,left:d.r<0?"auto":"50%",right:d.r<0?"50%":"auto"}}),
+              div({style:{position:"absolute",top:0,height:8,width:1,left:"50%",background:C.faint}})
+            ),
+            div({style:{fontFamily:MONO,color:d.r<0?C.low:C.teal,fontSize:12,width:44,textAlign:"right"}},d.r.toFixed(2))
+          )
+        ),
+        div({style:{fontSize:11,color:C.faint,fontFamily:MONO,paddingTop:4}},"中央線=相関ゼロ / 右=正 / 左=負")
+      )
+    )
+  );
+}
+
+// ─── COACH TAB ────────────────────────────────────────────────────────
+function Coach({hasData,coach,coaching,question,setQuestion,run}){
+  if(!hasData)return div({style:{background:C.surface,border:`1px solid ${C.line}`,borderRadius:12,padding:32,textAlign:"center",color:C.muted,fontSize:14}},"先にデータを取り込むと、あなたの数値に基づく助言を生成できます。");
+  return div({className:"space-y-4"},
+    div({style:{background:C.surface,border:`1px solid ${C.line}`,borderRadius:12,padding:20}},
+      div({style:{fontSize:14,fontWeight:600,marginBottom:4,display:"flex",alignItems:"center",gap:6}},
+        e(IcMsg,{size:15,style:{color:C.teal}}),"パーソナルコーチ"
+      ),
+      div({style:{fontSize:12,color:C.muted,marginBottom:16}},"あなたの実数値・相関・直近の兆候をもとに、具体的な助言を生成します。"),
+      btn({onClick:()=>run(""),disabled:coaching,style:{padding:"8px 16px",borderRadius:8,fontSize:13,color:"#fff",background:coaching?C.faint:C.teal,border:"none",cursor:coaching?"not-allowed":"pointer",display:"flex",alignItems:"center",gap:6}},
+        coaching?e(IcLoader,{size:14,style:{color:"#fff"}}):e(IcTrend,{size:14})," 今のコンディションを分析"
+      ),
+      div({style:{marginTop:12,display:"flex",gap:8}},
+        e('input',{value:question,onChange:ev=>setQuestion(ev.target.value),
+          onKeyDown:ev=>{if(ev.key==="Enter"&&question.trim())run(question);},
+          placeholder:"例: なぜ今日は低い? / 明日は登っていい?",
+          style:{flex:1,padding:"8px 12px",borderRadius:8,fontSize:13,border:`1px solid ${C.line}`,background:C.ground,color:C.ink,outline:"none"}}),
+        btn({onClick:()=>question.trim()&&run(question),disabled:coaching||!question.trim(),
+          style:{padding:"8px 12px",borderRadius:8,color:"#fff",background:question.trim()&&!coaching?C.teal:C.faint,border:"none",cursor:"pointer",display:"flex",alignItems:"center"}},
+          e(IcSend,{size:14})
+        )
+      )
+    ),
+    coaching&&div({style:{background:C.surface,border:`1px solid ${C.line}`,borderRadius:12,padding:24,textAlign:"center",color:C.muted}},
+      e(IcLoader,{size:20,style:{color:C.teal,display:"block",margin:"0 auto 8px"}}),
+      span({style:{fontSize:13}},"分析中…")
+    ),
+    coach&&!coaching&&div({style:{background:C.surface,border:`1px solid ${C.line}`,borderRadius:12,padding:20,fontSize:14,lineHeight:1.7,color:C.ink,whiteSpace:"pre-wrap"}},coach)
+  );
+}
+
+// ─── DATA TAB ─────────────────────────────────────────────────────────
+const todayISO=()=>{const d=new Date();return`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;};
+const GROUPS=[
+  {title:"睡眠",items:[["sleepScore","睡眠スコア",""],["deepSleepMin","深睡眠","分"],["_sleepH","睡眠 時間","h"],["_sleepM","睡眠 分","m"]]},
+  {title:"自律神経・心拍",items:[["hrv","HRV","ms"],["restingHR","安静時心拍","bpm"],["readiness","Readiness",""],["stress","ストレス",""]]},
+  {title:"活動",items:[["workoutDurationMin","運動時間","分"],["steps","歩数",""],["pai","PAI",""],["workoutCalories","運動kcal",""]]},
+];
+function NumIn({label,unit,value,onChange}){
+  return div(null,
+    e('label',{style:{fontSize:11,color:C.muted,display:"block",marginBottom:2}},label+(unit?` (${unit})`:"")),
+    e('input',{type:"number",inputMode:"decimal",value:value??"",onChange:ev=>onChange(ev.target.value),placeholder:"—",
+      style:{width:"100%",padding:"6px 8px",borderRadius:6,fontSize:13,border:`1px solid ${C.line}`,background:C.ground,color:C.ink,fontFamily:MONO,outline:"none"}})
+  );
+}
+
+function DataTab({files,mapping,setMapping,onFiles,applyImport,loadSample,clearAll,hasData,records,upsertEntry,deleteEntry}){
+  const [date,setDate]=useState(todayISO());
+  const [form,setForm]=useState({});
+  const [showCsv,setShowCsv]=useState(false);
+  const setF=(k,v)=>setForm(f=>({...f,[k]:v}));
+  const editing=records.some(r=>r.date===date);
+  const loadEdit=r=>{
+    const f={};
+    FIELDS.forEach(fld=>{if(isN(r[fld.key])&&fld.key!=="sleepDurationMin")f[fld.key]=String(r[fld.key]);});
+    if(isN(r.sleepDurationMin)){f._sleepH=String(Math.floor(r.sleepDurationMin/60));f._sleepM=String(r.sleepDurationMin%60);}
+    setDate(r.date);setForm(f);try{window.scrollTo({top:0,behavior:"smooth"});}catch{}
+  };
+  const save=()=>{
+    const rec={date};
+    FIELDS.forEach(fld=>{if(fld.key==="sleepDurationMin")return;const v=parseFloat(form[fld.key]);if(isFinite(v))rec[fld.key]=v;});
+    const h=parseFloat(form._sleepH),m=parseFloat(form._sleepM);
+    if(isFinite(h)||isFinite(m))rec.sleepDurationMin=(isFinite(h)?h:0)*60+(isFinite(m)?m:0);
+    upsertEntry(rec);setForm({});setDate(todayISO());
+  };
+  const allCols=[];files.forEach(f=>f.columns.forEach(c=>allCols.push({value:`${f.idx}\0${c}`,label:`${f.name} · ${c}`})));
+  const recent=[...records].sort((a,b)=>a.date<b.date?1:-1).slice(0,14);
+  const fmtSleep=min=>isN(min)?`${Math.floor(min/60)}h${pad(Math.round(min%60))}`:"—";
+
+  return div({className:"space-y-4"},
+    // entry form
+    div({style:{background:C.surface,border:`1px solid ${C.line}`,borderRadius:12,padding:20}},
+      div({style:{fontSize:14,fontWeight:600,marginBottom:4}},"記録をつける"),
+      div({style:{fontSize:12,color:C.muted,marginBottom:16}},"毎朝Zeppの画面を見ながら入力。空欄は無視されます。"),
+      div({style:{marginBottom:16}},
+        e('label',{style:{fontSize:11,color:C.muted,display:"block",marginBottom:2}},"日付"),
+        e('input',{type:"date",value:date,onChange:ev=>setDate(ev.target.value),
+          style:{padding:"6px 8px",borderRadius:6,fontSize:13,border:`1px solid ${C.line}`,background:C.ground,color:C.ink,fontFamily:MONO,outline:"none"}}),
+        editing&&span({style:{fontSize:11,color:C.teal,marginLeft:8}},"既存の記録を編集中")
+      ),
+      ...GROUPS.map(g=>div({key:g.title,style:{marginBottom:12}},
+        div({style:{fontSize:12,fontWeight:600,color:C.ink,marginBottom:6}},g.title),
+        div({style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}},
+          ...g.items.map(([k,label,unit])=>e(NumIn,{key:k,label,unit,value:form[k],onChange:v=>setF(k,v)}))
+        )
+      )),
+      div({style:{display:"flex",gap:8,marginTop:16}},
+        btn({onClick:save,style:{flex:1,padding:"10px 0",borderRadius:8,fontSize:13,color:"#fff",background:C.teal,border:"none",cursor:"pointer"}},editing?"上書き保存":"保存"),
+        btn({onClick:()=>{setForm({});setDate(todayISO());},style:{padding:"10px 16px",borderRadius:8,fontSize:13,background:C.ground,color:C.muted,border:"none",cursor:"pointer"}},"クリア")
+      )
+    ),
+    // list
+    records.length>0&&div({style:{background:C.surface,border:`1px solid ${C.line}`,borderRadius:12,padding:20}},
+      div({style:{fontSize:14,fontWeight:600,marginBottom:12}},`記録一覧 `,span({style:{color:C.faint,fontWeight:400,fontSize:12}},`（直近${recent.length}件）`)),
+      div(null,
+        ...recent.map(r=>div({key:r.date,style:{display:"flex",alignItems:"center",gap:8,padding:"8px 0",borderBottom:`1px solid ${C.line}`}},
+          span({style:{fontFamily:MONO,color:C.ink,fontSize:12,width:54,flexShrink:0}},r.date.slice(5)),
+          span({style:{fontFamily:MONO,color:C.muted,fontSize:11,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},
+            `HRV ${isN(r.hrv)?r.hrv:"—"} · ${isN(r.restingHR)?r.restingHR:"—"}bpm · ${fmtSleep(r.sleepDurationMin)} · ${isN(r.workoutDurationMin)?r.workoutDurationMin+"m":"—"}`
+          ),
+          btn({onClick:()=>loadEdit(r),style:{fontSize:11,padding:"2px 8px",borderRadius:6,color:C.teal,background:"none",border:`1px solid ${C.teal}`,cursor:"pointer"}},"編集"),
+          btn({onClick:()=>deleteEntry(r.date),style:{color:C.faint,background:"none",border:"none",cursor:"pointer",display:"flex",alignItems:"center"}},e(IcTrash,{size:14}))
+        ))
+      )
+    ),
+    // CSV
+    div({style:{background:C.surface,border:`1px solid ${C.line}`,borderRadius:12,padding:20}},
+      btn({onClick:()=>setShowCsv(s=>!s),style:{width:"100%",display:"flex",justifyContent:"space-between",alignItems:"center",fontSize:14,fontWeight:600,background:"none",border:"none",cursor:"pointer",color:C.ink}},
+        span(null,"CSVから取り込む"),
+        span({style:{color:C.faint,fontSize:11,fontWeight:400}},showCsv?"閉じる":"GDPR一括DL等を使う場合")
+      ),
+      showCsv&&div({style:{marginTop:16}},
+        div({style:{fontSize:12,color:C.muted,marginBottom:12}},"複数ファイルを選ぶと列を自動推定し、下で調整できます。"),
+        e('label',{style:{display:"block",borderRadius:8,border:`2px dashed ${C.line}`,padding:"20px 16px",textAlign:"center",cursor:"pointer",fontSize:13,color:C.muted}},
+          e(IcUpload,{size:18,style:{color:C.teal,display:"block",margin:"0 auto 8px"}}),
+          "ファイルを選択（.csv 複数可）",
+          e('input',{type:"file",accept:".csv,text/csv",multiple:true,style:{display:"none"},onChange:ev=>onFiles(ev.target.files)})
+        ),
+        files.length>0&&div({style:{marginTop:16}},
+          div({style:{fontSize:12,color:C.ink,marginBottom:6}},"日付列（ファイルごと）"),
+          ...files.map(f=>div({key:f.idx,style:{display:"flex",alignItems:"center",gap:8,marginBottom:4}},
+            span({style:{fontSize:11,color:C.muted,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},f.name),
+            e('select',{value:f.dateCol,onChange:ev=>{f.dateCol=ev.target.value;setMapping(m=>({...m}));},
+              style:{fontSize:11,padding:"4px 8px",borderRadius:6,border:`1px solid ${C.line}`,background:C.ground,color:C.ink}},
+              ...f.columns.map(c=>e('option',{key:c,value:c},c))
+            )
+          )),
+          div({style:{display:"flex",flexDirection:"column",gap:6,marginTop:12}},
+            ...FIELDS.map(fld=>div({key:fld.key,style:{display:"flex",alignItems:"center",gap:8}},
+              span({style:{fontSize:11,width:108,flexShrink:0,color:C.ink}},fld.label),
+              e('select',{value:mapping[fld.key]||"",onChange:ev=>setMapping(m=>({...m,[fld.key]:ev.target.value})),
+                style:{flex:1,fontSize:11,padding:"4px 8px",borderRadius:6,border:`1px solid ${C.line}`,background:C.ground,color:C.ink,minWidth:0}},
+                e('option',{value:""},"— なし —"),
+                ...allCols.map(c=>e('option',{key:c.value,value:c.value},c.label))
+              )
+            ))
+          ),
+          btn({onClick:applyImport,style:{marginTop:16,width:"100%",padding:"10px 0",borderRadius:8,fontSize:13,color:"#fff",background:C.teal,border:"none",cursor:"pointer"}},"この設定で取り込む（既存に統合）")
+        )
+      )
+    ),
+    // footer
+    div({style:{display:"flex",gap:8}},
+      btn({onClick:loadSample,style:{fontSize:11,padding:"6px 12px",borderRadius:8,background:C.tealSoft,color:C.teal,border:"none",cursor:"pointer",display:"flex",alignItems:"center",gap:4}},
+        e(IcFlask,{size:12})," サンプル読込"
+      ),
+      hasData&&btn({onClick:clearAll,style:{fontSize:11,padding:"6px 12px",borderRadius:8,background:"#FBF0EA",color:C.low,border:"none",cursor:"pointer",display:"flex",alignItems:"center",gap:4}},
+        e(IcTrash,{size:12})," 全消去"
+      )
+    )
+  );
+}
+
+// ─── EMPTY ────────────────────────────────────────────────────────────
+function Empty({onSample,onImport}){
+  return div({style:{background:C.surface,border:`1px solid ${C.line}`,borderRadius:12,padding:32,textAlign:"center"}},
+    div({style:{fontFamily:MONO,color:C.faint,fontSize:40,marginBottom:8}},"— —"),
+    e('h2',{style:{fontSize:16,fontWeight:600,margin:"0 0 4px"}},"まだデータがありません"),
+    div({style:{fontSize:13,color:C.muted,marginBottom:20}},"毎日の数値を手で入力するか、サンプルで動作を確認できます。"),
+    div({style:{display:"flex",gap:8,justifyContent:"center"}},
+      btn({onClick:onImport,style:{padding:"8px 16px",borderRadius:8,fontSize:13,color:"#fff",background:C.teal,border:"none",cursor:"pointer",display:"flex",alignItems:"center",gap:6}},
+        e(IcUpload,{size:14})," 今日の記録をつける"
+      ),
+      btn({onClick:onSample,style:{padding:"8px 16px",borderRadius:8,fontSize:13,color:C.teal,background:C.tealSoft,border:"none",cursor:"pointer",display:"flex",alignItems:"center",gap:6}},
+        e(IcFlask,{size:14})," サンプルで試す"
+      )
+    )
+  );
+}
+
+// ─── ROOT APP ─────────────────────────────────────────────────────────
+function App(){
+  const [tab,setTab]=useState("reading");
+  const [files,setFiles]=useState([]);
+  const [mapping,setMapping]=useState({});
+  const [records,setRecords]=useState([]);
+  const [loaded,setLoaded]=useState(false);
+  const [coach,setCoach]=useState(null);
+  const [coaching,setCoaching]=useState(false);
+  const [question,setQuestion]=useState("");
+  const [updateReady,setUpdateReady]=useState(false);
+
+  useEffect(()=>{
+    // hide splash
+    const splash=document.getElementById("splash");
+    if(splash)setTimeout(()=>splash.classList.add("fade"),200);
+    // load data
+    loadStore().then(s=>{
+      if(s?.records?.length){setRecords(s.records);setMapping(s.mapping||{});setFiles(s.files||[]);}
+      setLoaded(true);
+    });
+    // SW update
+    if("serviceWorker" in navigator){
+      navigator.serviceWorker.addEventListener("controllerchange",()=>setUpdateReady(true));
+    }
+  },[]);
+
+  const persist=useCallback((recs,map,fls)=>saveStore({records:recs,mapping:map,files:fls}),[]);
+  const analysis=useMemo(()=>analyze(records),[records]);
+
+  function autoMap(fls,prev){
+    const map={...prev};
+    for(const fld of FIELDS){if(map[fld.key])continue;for(const f of fls){const hit=f.columns.find(c=>fld.kw.some(k=>c.toLowerCase().replace(/[_\s]/g,"").includes(k)));if(hit){map[fld.key]=`${f.idx}\0${hit}`;break;}}}
+    return map;
+  }
+  const onFiles=async fileList=>{
+    const next=[...files];
+    for(const file of Array.from(fileList)){
+      const text=await file.text();
+      const parsed=Papa.parse(text,{header:true,skipEmptyLines:true});
+      const cols=parsed.meta.fields||[];if(!cols.length)continue;
+      const dateCol=cols.find(c=>/date|time|day|日付/i.test(c))||cols[0];
+      next.push({idx:next.length,name:file.name,rows:parsed.data,columns:cols,dateCol});
+    }
+    setFiles(next);setMapping(prev=>autoMap(next,prev));
+  };
+  const applyImport=()=>{const recs=buildRecords(files,mapping);setRecords(recs);persist(recs,mapping,files);setTab("reading");};
+  const loadSample=()=>{const recs=sampleRecords();setRecords(recs);setFiles([]);setMapping({});persist(recs,{},[]);setTab("reading");};
+  const clearAll=()=>{setRecords([]);setFiles([]);setMapping({});setCoach(null);saveStore({records:[],mapping:{},files:[]});};
+  const upsertEntry=rec=>{const recs=[...records.filter(r=>r.date!==rec.date),rec].sort((a,b)=>a.date<b.date?-1:1);setRecords(recs);persist(recs,mapping,files);};
+  const deleteEntry=date=>{const recs=records.filter(r=>r.date!==date);setRecords(recs);persist(recs,mapping,files);};
+
+  const runCoach=async userQ=>{
+    if(!analysis)return;setCoaching(true);setCoach(null);
+    const recent=analysis.records.slice(-21).map(r=>({date:r.date,condition:r.condition,load:r.load,hrv:r.hrv,rhr:r.restingHR,deep:r.deepSleepMin,sleepMin:r.sleepDurationMin,stress:r.stress}));
+    const lagTxt=analysis.lags.map(l=>`lag+${l.k}日: r=${isN(l.r)?l.r.toFixed(2):"n/a"}(n=${l.n})`).join(", ");
+    const drvTxt=analysis.drivers.slice(0,5).map(d=>`${d.label}: r=${d.r.toFixed(2)}`).join(", ");
+    const flagTxt=analysis.flags.map(f=>f.msg).join(" / ")||"なし";
+    const sys="あなたは睡眠・HRV・トレーニング負荷データを読むリカバリーコーチです。日本語で、相手の実数値とパターンに基づく具体的で実行可能な助言を簡潔に返します。一般論ではなく、与えられたデータの傾向を根拠として示してください。これは医療診断ではない旨を踏まえ、HRV低下や安静時心拍上昇が続くなど気になる兆候があれば受診を促してください。箇条書き中心、4項目以内。";
+    const prompt=`直近データ: ${JSON.stringify(recent)}\nラグ相関: ${lagTxt}\nドライバー: ${drvTxt}\nフラグ: ${flagTxt}${userQ?`\n質問: ${userQ}`:""}\n\n助言を返してください。`;
+    try{
+      const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:1000,system:sys,messages:[{role:"user",content:prompt}]})});
+      const data=await res.json();
+      const txt=(data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("\n").trim();
+      setCoach(txt||"応答を取得できませんでした。");
+    }catch{setCoach("AIコーチへの接続に失敗しました。インターネット接続を確認してください。");}
+    finally{setCoaching(false);}
+  };
+
+  if(!loaded)return null;
+
+  const hasData=records.length>0;
+  const series=analysis?analysis.records.map(r=>({date:r.date.slice(5),condition:r.condition,load:r.load})):[];
+
+  const TABS=[["reading","今日",IcActivity],["correlation","相関",IcGitBranch],["coach","コーチ",IcMsg],["data","データ",IcDB]];
+
+  return div({style:{background:C.ground,minHeight:"100vh",color:C.ink}},
+    // update banner
+    updateReady&&div({style:{background:C.teal,color:"#fff",fontSize:13,padding:"8px 16px",display:"flex",alignItems:"center",justifyContent:"space-between"}},
+      span(null,"アップデートがあります"),
+      btn({onClick:()=>window.location.reload(),style:{background:"rgba(255,255,255,0.2)",border:"none",color:"#fff",padding:"4px 12px",borderRadius:6,fontSize:12,cursor:"pointer",display:"flex",alignItems:"center",gap:4}},
+        e(IcRefresh,{size:12})," 更新"
+      )
+    ),
+    // main content
+    div({style:{maxWidth:672,margin:"0 auto",padding:"16px 16px 100px"}},
+      // header
+      div({style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:4}},
+        div(null,
+          div({style:{fontFamily:MONO,color:C.teal,letterSpacing:"0.18em",fontSize:11}},"CONDITION MONITOR"),
+          e('h1',{style:{fontSize:18,fontWeight:600,letterSpacing:"-0.01em",margin:0}},"身体データ統合モニター")
+        ),
+        div({style:{fontFamily:MONO,fontSize:11,textAlign:"right"}},
+          div({style:{color:C.faint}},"記録"),
+          div({style:{color:C.ink}},`${records.length} 日分`)
+        )
+      ),
+      // tab bar (top, desktop)
+      div({style:{display:"flex",gap:4,margin:"16px 0 20px",padding:4,borderRadius:10,background:C.surface,border:`1px solid ${C.line}`}},
+        ...TABS.map(([id,label,Ic])=>btn({key:id,onClick:()=>setTab(id),style:{flex:1,display:"flex",alignItems:"center",justifyContent:"center",gap:4,padding:"8px 4px",borderRadius:7,border:"none",fontSize:13,cursor:"pointer",background:tab===id?C.teal:"none",color:tab===id?"#fff":C.muted,fontWeight:tab===id?600:400}},
+          e(Ic,{size:14})," ",label
+        ))
+      ),
+      // content
+      !hasData&&tab!=="data"&&e(Empty,{onSample:loadSample,onImport:()=>setTab("data")}),
+      hasData&&tab==="reading"&&e(Reading,{a:analysis,series}),
+      hasData&&tab==="correlation"&&e(Correlation,{a:analysis}),
+      tab==="coach"&&e(Coach,{hasData,coach,coaching,question,setQuestion,run:runCoach}),
+      tab==="data"&&e(DataTab,{files,mapping,setMapping,onFiles,applyImport,loadSample,clearAll,hasData,records,upsertEntry,deleteEntry}),
+      // disclaimer
+      e('p',{style:{fontSize:11,textAlign:"center",color:C.faint,marginTop:24}},"一般的な健康・トレーニング情報であり医療診断ではありません。気になる兆候が続く場合は専門家に相談を。")
+    ),
+    // bottom nav (mobile)
+    div({style:{position:"fixed",bottom:0,left:0,right:0,background:C.surface,borderTop:`1px solid ${C.line}`,paddingBottom:"env(safe-area-inset-bottom)",display:"flex",zIndex:100}},
+      ...TABS.map(([id,label,Ic])=>btn({key:id,onClick:()=>setTab(id),style:{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"10px 0",border:"none",background:"none",cursor:"pointer",color:tab===id?C.teal:C.faint,fontSize:10,fontWeight:tab===id?600:400,gap:3}},
+        e(Ic,{size:20}),label
+      ))
+    )
+  );
+}
+
+// ─── mount ────────────────────────────────────────────────────────────
+const root=ReactDOM.createRoot(document.getElementById("root"));
+root.render(e(App,null));
+</script>
+
+<script>
+// Service Worker
+if("serviceWorker" in navigator){
+  window.addEventListener("load",()=>{
+    navigator.serviceWorker.register("./sw.js",{scope:"./"})
+      .then(r=>{console.log("[SW]",r.scope);setInterval(()=>r.update(),60000);})
+      .catch(err=>console.warn("[SW] fail",err));
+  });
+}
+// iOS hint
+const isIOS=/iphone|ipad|ipod/i.test(navigator.userAgent);
+const isStandalone=("standalone" in navigator)&&navigator.standalone;
+if(isIOS&&!isStandalone){
+  const last=localStorage.getItem("pwa-hint");
+  if(!last||Date.now()-Number(last)>7*86400000){
+    window.addEventListener("load",()=>{
+      setTimeout(()=>{
+        const b=document.createElement("div");
+        b.style.cssText="position:fixed;bottom:0;left:0;right:0;background:#15706B;color:white;padding:12px 16px;padding-bottom:calc(12px + env(safe-area-inset-bottom));z-index:9999;font-size:13px";
+        b.innerHTML='<div style="font-weight:600;margin-bottom:4px">ホーム画面に追加できます</div><div style="opacity:.8;font-size:12px">Safari → 共有（□↑）→「ホーム画面に追加」でオフラインでも使えます</div><button onclick="this.parentElement.remove()" style="margin-top:8px;background:rgba(255,255,255,.2);border:none;color:white;padding:5px 14px;border-radius:8px;font-size:12px;cursor:pointer">閉じる</button>';
+        document.body.appendChild(b);
+        localStorage.setItem("pwa-hint",Date.now());
+      },3000);
+    });
+  }
+}
+</script>
+</body>
+</html>
